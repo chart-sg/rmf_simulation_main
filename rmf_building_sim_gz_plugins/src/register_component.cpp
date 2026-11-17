@@ -181,7 +181,8 @@ private:
     sdf->Get<double>("a_nom_cabin", data.params.a_nom, 0.08);
     sdf->Get<double>("dx_min_cabin", data.params.dx_min, 0.01);
     sdf->Get<double>("f_max_cabin", data.params.f_max, 100.0);
-
+    // Load door auto-close timeout from SDF (-1 means disabled)
+    sdf->Get<double>("door_open_time", data.door_open_time, -1.0);
     if (!sdf->Get<std::string>("cabin_joint_name", data.cabin_joint, ""))
       return std::nullopt;
 
