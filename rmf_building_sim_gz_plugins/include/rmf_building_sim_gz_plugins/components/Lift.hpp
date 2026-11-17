@@ -47,6 +47,9 @@ struct LiftData
   std::string initial_floor;
   rmf_building_sim_gz_plugins::MotionParams params;
   std::string cabin_joint;
+  // Seconds Human-mode doors stay open before closing on their own
+  // (<= 0 disables the auto-close)
+  double door_open_time = -1.0;
 };
 
 struct LiftCommand

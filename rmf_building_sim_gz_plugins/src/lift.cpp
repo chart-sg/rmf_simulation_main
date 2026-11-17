@@ -28,6 +28,8 @@
 #include <rmf_lift_msgs/msg/lift_request.hpp>
 #include <rmf_lift_msgs/msg/lift_state.hpp>
 
+#include <cmath>
+
 using namespace gz::sim;
 
 using DoorMode = rmf_door_msgs::msg::DoorMode;
@@ -58,6 +60,9 @@ private:
   std::unordered_map<Entity, double> _last_cmd_vel;
   std::unordered_map<Entity, LiftCommand> _last_lift_command;
   std::unordered_map<Entity, LiftState> _last_states;
+
+  // Remaining door-open countdown for each lift (-1 = inactive)
+  std::unordered_map<Entity, double> _door_open_timer;
 
   // Saves the last timestamp a door state was sent
   std::unordered_map<Entity, double> _last_state_pub;
@@ -107,6 +112,7 @@ private:
       const components::Lift* lift_comp) -> bool
       {
         const auto& lift = lift_comp->Data();
+        _door_open_timer[entity] = -1.0;
         auto cabin_joint_entity =
           Model(entity).JointByName(ecm, lift.cabin_joint);
         enableComponent<components::AxisAlignedBox>(ecm, entity);
@@ -422,11 +428,30 @@ private:
     msg.current_mode = msg.MODE_AGV;
     msg.session_id = lift_cmd != nullptr ?
       lift_cmd->Data().session_id : "";
+
     auto it = _last_lift_command.find(entity);
     if (it != _last_lift_command.end())
     {
       msg.session_id = it->second.session_id;
+
+      if (it->second.request_type == LiftRequest::REQUEST_HUMAN_MODE)
+      {
+        msg.current_mode = msg.MODE_HUMAN;
+      }
     }
+
+    // Publish remaining time only when the Human-mode timer is active
+    if (msg.current_mode == msg.MODE_HUMAN && lift.door_open_time > 0.0)
+    {
+      auto timer_it = _door_open_timer.find(entity);
+
+      if (timer_it != _door_open_timer.end() && timer_it->second >= 0.0)
+      {
+        msg.door_open_time.push_back(
+          static_cast<int32_t>(std::ceil(timer_it->second)));
+      }
+    }
+
     return msg;
   }
 
@@ -497,11 +522,16 @@ public:
             if (it != _last_lift_command.end() &&
             (it->second.destination_floor != msg->destination_floor ||
             it->second.request_type != msg->request_type ||
-            it->second.session_id != msg->session_id))
+            it->second.session_id != msg->session_id ||
+            it->second.door_state != lift_command.door_state))
             {
               RCLCPP_INFO(_ros_node->get_logger(),
               "Lift [%s] requested at level [%s]",
               msg->lift_name.c_str(), msg->destination_floor.c_str());
+              
+              // Reset countdown when a new command is accepted
+              _door_open_timer[entity] = -1.0;
+
               _last_lift_command[entity] = lift_command;
               ecm->CreateComponent<components::LiftCmd>(entity,
               components::LiftCmd(lift_command));
@@ -592,14 +622,53 @@ public:
         const auto& destination_floor = lift_cmd->destination_floor;
         const double target_elevation = lift.floors.at(
           destination_floor).elevation;
-        const auto target_door_state = lift_cmd->door_state;
+        auto target_door_state = lift_cmd->door_state;
         const std::string cur_floor = get_current_floor(entity, ecm, lift);
 
         const auto doors = get_floor_doors(ecm, lift, cur_floor);
 
         if (std::abs(pose.Z() - target_elevation) < lift.params.dx_min)
         {
-          // Just command the doors to the target state
+          // Human mode: start countdown once doors are fully open
+          if (lift_cmd->request_type == LiftRequest::REQUEST_HUMAN_MODE &&
+            lift.door_open_time > 0.0 &&
+            target_door_state == DoorModeCmp::OPEN)
+          {
+            if (all_doors_at_state(ecm, doors, DoorModeCmp::OPEN))
+            {
+              auto& timer = _door_open_timer[entity];
+
+              if (timer < 0.0)
+              {
+                // Initialize countdown from the configured timeout
+                timer = lift.door_open_time;
+              }
+              else
+              {
+                // Decrease countdown using simulation time
+                timer = std::max(0.0, timer - dt);
+              }
+
+              if (timer <= 0.0)
+              {
+                // Timer expired: close doors and keep countdown at zero
+                timer = 0.0;
+                target_door_state = DoorModeCmp::CLOSE;
+
+                // Update both the active command and the stored command to
+                // prevent the doors reopening on the next update, once they
+                // are no longer fully open and this branch is skipped
+                if (auto* active_cmd = ecm.Component<components::LiftCmd>(
+                    entity))
+                {
+                  active_cmd->Data().door_state = DoorModeCmp::CLOSE;
+                }
+                _last_lift_command[entity].door_state = DoorModeCmp::CLOSE;
+              }
+            }
+          }
+
+          // Command doors according to the effective target state
           command_doors(ecm, doors, target_door_state);
           // Clear the command if it was finished
           if (destination_floor == cur_floor &&
@@ -610,6 +679,9 @@ public:
         }
         else
         {
+          // Reset door countdown while travelling between floors
+          _door_open_timer[entity] = -1.0;
+          
           // Make sure doors are closed before moving to next floor
           command_doors(ecm, doors, DoorModeCmp::CLOSE);
           if (all_doors_at_state(ecm, doors, DoorModeCmp::CLOSE))
